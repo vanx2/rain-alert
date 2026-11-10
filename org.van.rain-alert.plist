@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    雨予報通知用のLaunchDaemon設定です。
+    導入時はこのファイルを /Library/LaunchDaemons/ にコピーし、
+    root:wheel / chmod 644 にしたうえで、launchctl bootstrap します。
+  -->
+  <key>Label</key>
+  <string>org.van.rain-alert</string>
+  <key>UserName</key>
+  <string>v</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/v/.nodebrew/current/bin/node</string>
+    <string>/Users/v/scripts/rain-alert/rain-check.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/v/scripts/rain-alert</string>
+
+  <!--
+    300秒（5分）間隔で実行します。
+    毎時00、05、10分に厳密に実行する指定ではありません。
+  -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/v/Library/Logs/vscript/rain-alert.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/v/Library/Logs/vscript/rain-alert_err.log</string>
+</dict>
+</plist>
