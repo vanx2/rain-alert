@@ -1,176 +1,123 @@
 'use strict';
 
 // ============================================================================
-// 雨が降り始める前に Google Home Mini へ通知するスクリプト
+// Yahoo!気象情報API -> Google Home 雨通知
 // ============================================================================
 //
-// 【目的】
-//   Yahoo!気象情報APIから現在の降雨と今後60分間の予測を取得します。
-//   現在ほぼ降っておらず、30分以内に一定以上の雨が予測されたときに、
-//   同じMac miniで動いているslack2googlehomeの/say APIを呼び出します。
-//
-// 【実行環境】
-//   Node.js 22以上。外部npmパッケージは使用しません。
-//   launchdから5分間隔で起動する想定で、1回の実行が終われば終了します。
-//
-// 【実行方法】
+// 実行方法:
 //   node rain-check.js
-//     本番実行（必要なら通知・状態保存）
+//     本番実行。必要に応じてGoogle Homeへ通知し、state.jsonを更新。
 //
 //   node rain-check.js --dry-run
-//     実際のAPIを取得して判定のみ表示
+//     実際のAPIを取得して判定するが、通知・状態保存はしない。
 //
-//   node rain-check.js --fixture x.json
-//     JSONファイルで模擬テスト（通知・保存なし）
+//   node rain-check.js --fixture sample.json --at 2026-11-11T12:00:00+09:00
+//     サンプルJSONを使って指定日時の動作を検証する。
 //
-// 【注意】
-//   Yahoo!気象情報APIの利用条件を確認してから運用してください。
-//   特に家庭内だけで使う非公開用途が許可されるかに注意が必要です。
-//   このスクリプトはHTTP APIを定期取得する方式で、Yahoo!からの
-//   Webhook通知を待ち受ける方式ではありません。
+// 通知条件は隣のalert-rules.jsで管理します。
+// 外部npmパッケージは不要。Node.js 22で動作します。
+//
+// 処理の流れ:
+//   1. Yahoo! APIから観測値と予測値を取得
+//   2. 実測値によって「降雨中・降雨後の通知停止」を判定
+//   3. 通知停止中でなければ予測通知ルールを評価
+//   4. 条件を満たしたルールだけGoogle Homeへ通知
+//   5. ルール別の通知履歴をstate.jsonへ保存
 
-// Node.js標準モジュールのみ使用します。
-// fs   : 設定ファイルと通知済み状態ファイルの読み書き
-// path : OS上のファイルパスの結合
 const fs = require('node:fs');
 const path = require('node:path');
+const config = require('./alert-rules');
 
-// ---------------------------------------------------------------------------
-// 設定値：普段の運用で変更したくなったら、主にこの部分を編集してください。
-// ---------------------------------------------------------------------------
-
-// ユーザーのホームディレクトリ（launchdのUserNameと合わせます）。
-const HOME = '/Users/v';
-const APP_DIR = path.join(HOME, 'scripts/rain-alert');
-
-// Yahoo!のClient IDを保存するファイル。1行にIDだけを記載します。
-// 秘密情報をソースコードやGitHubに埋め込まないため、別ファイルにしています。
-const CONFIG = path.join(APP_DIR, 'yahoo-appid');
-
-// 前回通知したかどうかを保持するファイル（Mac再起動後も引き継ぎます）。
-// 初回実行では存在しなくても構いません。
-const STATE_DIR = APP_DIR;
+const APP_DIR = __dirname;
+const APPID_PATH = path.join(APP_DIR, 'yahoo-appid');
 const STATE_PATH = path.join(APP_DIR, 'state.json');
 
-// JR住吉駅付近の概略地点。Yahoo! APIでは「経度,緯度」の順です。
-// 正確な地点に変えたい場合のみ、この値を編集します。
-const COORDINATES = '135.261859,34.719595';
+const MINUTE = 60 * 1000;
 
-// 雨の強さの単位は mm/h（1時間に何mmの雨に相当するか）。
-// 予測値がこの値以上なら「雨が来る」と判定します。
-const RAIN_THRESHOLD = 0.5;
+// ============================================================================
+// 通知ルールの設定チェック
+// ============================================================================
 
-// 「今はまだ降っていない」とみなす現在の降水強度。
-// 実測値がこの値未満のときにだけ、事前通知の候補にします。
-const CURRENT_DRY_THRESHOLD = 0.1;
+function validateRules() {
+  const ids = new Set();
 
-// 何分以内の雨を通知対象にするか（このサンプルは0～30分以内）。
-// ※「必ず15～30分前」と厳密に限定するものではありません。
-//   予報の更新が遅れ、直前に初めて検知した場合にも通知します。
-const LOOKAHEAD_MINUTES = 30;
+  for (const rule of config.rules) {
 
-// 実測・予測ともに雨がない状態が30分続いたら「通知済み」を解除します。
-// 一時的に予報が晴れになっただけで何度も通知するのを防ぐためです。
-const CLEAR_RESET_MINUTES = 30;
-
-// 23:00～翌6:59は、Google Homeの読み上げ通知を行いません。
-// 深夜も予報の取得・状態の更新は継続します。
-const QUIET_START = 23;
-const QUIET_END = 7;
-
-// ---------------------------------------------------------------------------
-// Yahoo! APIの日付文字列をJavaScriptのDateに変換する
-// ---------------------------------------------------------------------------
-
-// Yahoo! APIの日付文字列（例：202611101045）をDateに変換します。
-// 文字列にはタイムゾーン情報が含まれないため「日本時間（JST）」と解釈し、
-// 9時間差を補正してUTCの時刻を作ります。
-// Dateの内部値は世界共通の時刻なので、後続の差分計算に利用できます。
-function jstDate(yyyymmddhhmm) {
-  if (!/^\d{12}$/.test(yyyymmddhhmm)) {
-    throw new Error('Invalid Weather.Date');
-  }
-
-  const y = Number(yyyymmddhhmm.slice(0, 4));
-  const mo = Number(yyyymmddhhmm.slice(4, 6));
-  const d = Number(yyyymmddhhmm.slice(6, 8));
-  const h = Number(yyyymmddhhmm.slice(8, 10));
-  const mi = Number(yyyymmddhhmm.slice(10, 12));
-
-  return new Date(Date.UTC(y, mo - 1, d, h - 9, mi));
-}
-
-// ---------------------------------------------------------------------------
-// 通知済み状態の読み込み
-// ---------------------------------------------------------------------------
-
-// 前回の状態を読み取ります。
-// alerted   : 直近の降雨イベントについて既に読み上げたか
-// clearSince: 「雨がない」という判定が連続し始めた時刻（Unixミリ秒）
-//
-// 初回起動などでstate.jsonが無い場合は、未通知の状態で開始します。
-// 破損したJSONなど、ファイル未存在以外のエラーは隠さず上位へ伝えます。
-function readState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      return { alerted: false, clearSince: null };
+    // ルールIDは通知履歴のキーなので重複禁止。
+    if (!rule.id || ids.has(rule.id)) {
+      throw new Error(`Duplicate/empty rule id: ${rule.id}`);
     }
-    throw err;
+
+    ids.add(rule.id);
+
+    if (rule.type !== 'forecast') {
+      throw new Error(`Unsupported rule type: ${rule.type}`);
+    }
+
+    // Yahoo! APIの予測範囲は最大60分。
+    if (
+      !Number.isFinite(rule.minLeadMinutes) ||
+      !Number.isFinite(rule.maxLeadMinutes) ||
+      rule.minLeadMinutes < 0 ||
+      rule.maxLeadMinutes > 60 ||
+      rule.minLeadMinutes >= rule.maxLeadMinutes
+    ) {
+      throw new Error(`Invalid lead time range: ${rule.id}`);
+    }
   }
 }
 
-// ---------------------------------------------------------------------------
-// 通知済み状態の保存
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Yahoo! APIの日付処理
+// ============================================================================
 
-// 判定結果を次回の起動へ引き継ぐために保存します。
-// 一時ファイルに書いてからrenameすることで、書き込み途中のstate.jsonを
-// 次の起動が読んでしまう可能性を減らしています。
-// 保存先ディレクトリは700、ファイルは600（所有者のみアクセス可）です。
-function saveState(state) {
-  fs.mkdirSync(STATE_DIR, {
-    recursive: true,
-    mode: 0o700
-  });
+// Yahoo!のYYYYMMDDHHmmはJSTと解釈してUnix時刻へ変換。
+// JSTとUTCの9時間差を補正します。
+function parseJstTime(value) {
+  const s = String(value);
 
-  const temp = `${STATE_PATH}.${process.pid}.tmp`;
+  if (!/^\d{12}$/.test(s)) {
+    throw new Error(`Invalid weather Date: ${s}`);
+  }
 
-  fs.writeFileSync(
-    temp,
-    JSON.stringify(state, null, 2) + '\n',
-    { mode: 0o600 }
-  );
+  const y = +s.slice(0, 4);
+  const mo = +s.slice(4, 6);
+  const d = +s.slice(6, 8);
+  const h = +s.slice(8, 10);
+  const mi = +s.slice(10, 12);
 
-  fs.renameSync(temp, STATE_PATH);
+  const ms = Date.UTC(y, mo - 1, d, h - 9, mi);
+
+  if (!Number.isFinite(ms)) {
+    throw new Error(`Invalid weather Date: ${s}`);
+  }
+
+  return ms;
 }
 
-// ---------------------------------------------------------------------------
-// Yahoo!気象情報APIから降雨データを取得
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Yahoo! APIへのアクセス
+// ============================================================================
 
-// --fixtureが指定された場合はネットワークを使わず、指定JSONを読み込みます。
-// 通常実行では ~/.config/rain-alert/yahoo-appid のClient IDを使います。
-// タイムアウトは10秒。HTTPエラーの場合は例外とし、誤って「雨なし」と
-// 判定することを防ぎます。
 async function loadWeather(fixture) {
+
+  // 模擬テストの場合はAPI通信を行わない。
   if (fixture) {
     return JSON.parse(fs.readFileSync(fixture, 'utf8'));
   }
 
-  const appid = fs.readFileSync(CONFIG, 'utf8').trim();
+  // Client IDはソースコードに埋め込まず別ファイルから取得。
+  const appid = fs.readFileSync(APPID_PATH, 'utf8').trim();
 
   if (!appid) {
-    throw new Error('Yahoo Client ID is empty');
+    throw new Error('yahoo-appid is empty');
   }
 
-  // coordinatesは経度,緯度、interval=5は5分間隔を指定します。
   const url = new URL('https://map.yahooapis.jp/weather/V1/place');
 
   url.search = new URLSearchParams({
     appid,
-    coordinates: COORDINATES,
+    coordinates: config.coordinates,
     output: 'json',
     interval: '5'
   }).toString();
@@ -186,18 +133,17 @@ async function loadWeather(fixture) {
   return response.json();
 }
 
-// ---------------------------------------------------------------------------
-// 降雨データを解析
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 観測値と予測値の抽出
+// ============================================================================
 
-// APIレスポンスを解析し、通知に必要な3つの情報を返します。
-// observedRain : 最新の観測降水強度（mm/h）
-// allClear     : 現在の実測がほぼ0、かつ今後60分の予報も閾値未満か
-// minutes      : 最初に閾値以上の雨が予測されるまでの分数
-//                （60分内に予測がなければnull）
+// observation: 最新の降水強度。
+// forecast   : 今後60分以内で、最初に降雨閾値を超える時刻。
 //
-// APIのレスポンス形式が予想と違う場合は、誤通知しないよう例外にします。
-function getRainInfo(data, nowMs) {
+// 古い観測値を使って「雨がやんだ」と誤判定することを防ぐため、
+// 実測時刻の新しさもチェックします。
+function getWeatherInfo(data, nowMs) {
+
   if (Number(data?.ResultInfo?.Status) !== 200) {
     throw new Error('Yahoo returned an unsuccessful result');
   }
@@ -208,80 +154,325 @@ function getRainInfo(data, nowMs) {
     throw new Error('Missing Weather array');
   }
 
-  // Rainfallを数値に、Dateをタイムスタンプに変換します。
-  // 数値が欠落しているときは0と決めつけずエラーにします。
   const rows = list.map((entry) => {
+
     if (entry.Rainfall === '' || entry.Rainfall == null) {
-      throw new Error('Missing rainfall value');
+      throw new Error('Missing Rainfall');
+    }
+
+    const rain = Number(entry.Rainfall);
+    const timeMs = parseJstTime(entry.Date);
+
+    if (!Number.isFinite(rain) || rain < 0) {
+      throw new Error('Invalid Rainfall');
     }
 
     return {
       type: entry.Type,
-      rain: Number(entry.Rainfall),
-      timeMs: jstDate(String(entry.Date)).getTime()
+      rain,
+      timeMs
     };
   });
 
-  if (rows.some((r) =>
-    !Number.isFinite(r.rain) ||
-    r.rain < 0 ||
-    !Number.isFinite(r.timeMs)
-  )) {
-    throw new Error('Invalid rainfall response');
-  }
-
-  // 観測値が複数あれば日時が最も新しいものを使います。
-  const observations = rows
+  // 最新のobservationを取得。
+  const obs = rows
     .filter((r) => r.type === 'observation')
-    .sort((a, b) => b.timeMs - a.timeMs);
+    .sort((a, b) => b.timeMs - a.timeMs)[0];
 
-  if (!observations.length) {
-    throw new Error('Missing current observation');
+  if (!obs) {
+    throw new Error('Missing observation');
   }
 
-  // 現在より未来、かつ60分以内の予測だけを抽出します。
-  // リセット判定では60分先まで見ています。
-  const forecasts = rows
+  // 実測値が古すぎる場合は通知判定をしない。
+  if (
+    nowMs - obs.timeMs >
+      config.maxObservationAgeMinutes * MINUTE ||
+    obs.timeMs - nowMs > 2 * MINUTE
+  ) {
+    throw new Error('Observation is stale or in the future');
+  }
+
+  // 現在より未来、かつ60分以内の予測だけを対象とする。
+  const forecast = rows
     .filter((r) =>
       r.type === 'forecast' &&
       r.timeMs > nowMs &&
-      r.timeMs <= nowMs + 60 * 60000
+      r.timeMs <= nowMs + 60 * MINUTE
     )
     .sort((a, b) => a.timeMs - b.timeMs);
 
-  if (!forecasts.length) {
+  if (!forecast.length) {
     throw new Error('Missing future forecasts');
   }
 
-  // 閾値以上の雨が最初に予測される時刻を探します。
-  const firstWet = forecasts.find((r) => r.rain >= RAIN_THRESHOLD);
-
-  const minutes = firstWet
-    ? Math.round((firstWet.timeMs - nowMs) / 60000)
-    : null;
+  // 最初に一定以上の雨が予測される時刻を探す。
+  const firstWet = forecast.find(
+    (r) => r.rain >= config.forecastRainThreshold
+  );
 
   return {
-    observedRain: observations[0].rain,
-    allClear:
-      observations[0].rain < CURRENT_DRY_THRESHOLD &&
-      forecasts.every((r) => r.rain < RAIN_THRESHOLD),
-    minutes
+    observationRain: obs.rain,
+    observationTime: obs.timeMs,
+
+    firstRainAt: firstWet?.timeMs ?? null,
+
+    // 雨の予測開始までの残り時間（分）。
+    minutesToRain: firstWet
+      ? (firstWet.timeMs - nowMs) / MINUTE
+      : null
   };
 }
 
-// ---------------------------------------------------------------------------
-// Google Home Miniへ通知
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 状態ファイルの読み書き
+// ============================================================================
 
-// ローカルで起動中のslack2googlehomeの/say APIを利用します。
-// Google Homeに直接アクセスする必要はありません。
+// sentRules:
+//   ルールIDごとの通知済み履歴。
+//   例：{ forecast_60: true, forecast_5: true }
 //
-// HTTP成功をもって通知依頼の成功と判断します。
-// Google Homeで実際に音声が再生されたことまでは確認できません。
-async function notifyHome() {
+// rainLock:
+//   実測で雨を検知したため通知停止中か。
+//
+// drySince:
+//   雨がやんだ状態が始まった実測時刻。
+//
+// noForecastSince:
+//   降雨予測が消えた状態が始まった時刻。
+//
+// lastObservationAt:
+//   最後に確認できた実測時刻。
+
+function normalizeState(raw = {}) {
+
+  const sentRules = { ...(raw.sentRules || {}) };
+
+  // 旧版state.jsonからの移行。
+  // 旧版の通知がすでに行われていた場合は、
+  // 新しい通知が重複しないよう両ルールを通知済みにする。
+  if (
+    !raw.sentRules &&
+    (raw.alerted || raw.forecastAlerted)
+  ) {
+    for (const rule of config.rules) {
+      sentRules[rule.id] = true;
+    }
+  }
+
+  return {
+    version: 2,
+    sentRules,
+    rainLock: Boolean(raw.rainLock),
+    drySince: raw.drySince ?? null,
+    noForecastSince: raw.noForecastSince ?? null,
+    lastObservationAt: raw.lastObservationAt ?? null
+  };
+}
+
+function readState() {
+  try {
+    const raw = JSON.parse(
+      fs.readFileSync(STATE_PATH, 'utf8')
+    );
+
+    return normalizeState(raw);
+
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return normalizeState();
+    }
+
+    throw err;
+  }
+}
+
+// 一時ファイルを経由して状態を保存。
+// 途中で処理が落ちてもstate.jsonが壊れにくい方法。
+function saveState(state) {
+  const tmp = `${STATE_PATH}.${process.pid}.tmp`;
+
+  fs.writeFileSync(
+    tmp,
+    JSON.stringify(state, null, 2) + '\n',
+    { mode: 0o600 }
+  );
+
+  fs.renameSync(tmp, STATE_PATH);
+}
+
+// ============================================================================
+// 降雨状態の管理
+// ============================================================================
+
+// 実測で雨を検知したらrainLockを有効化。
+// 以後、60分連続して雨が降っていないことを確認するまで解除しない。
+//
+// API取得に失敗して観測データが長時間途切れた場合は、
+// その時間を「雨がやんでいた時間」とはみなさず数え直す。
+//
+// また、雨が実際には降らず予報だけ消えた場合も、
+// 60分間予報が消えた状態が続けば通知履歴をリセットする。
+
+function advanceState(previous, info, nowMs) {
+
+  const state = normalizeState(previous);
+
+  const wet =
+    info.observationRain >=
+    config.observationWetThreshold;
+
+  const last = state.lastObservationAt;
+
+  if (
+    last !== null &&
+    info.observationTime < last
+  ) {
+    throw new Error('Observation time moved backwards');
+  }
+
+  // 実測データが15分以上飛んだか。
+  const gap =
+    last !== null &&
+    info.observationTime - last >
+      config.maxObservationGapMinutes * MINUTE;
+
+  if (!config.rainLock.enabled) {
+
+    // 降雨後の通知停止ルールを無効化した場合。
+    state.rainLock = false;
+    state.drySince = null;
+
+  } else if (wet) {
+
+    // 雨が降っている。通知停止を維持。
+    state.rainLock = true;
+    state.drySince = null;
+
+  } else if (state.rainLock) {
+
+    // 雨がやんでいる。
+    // 最初の乾燥観測時刻から60分を数える。
+    if (state.drySince === null || gap) {
+      state.drySince = info.observationTime;
+    }
+
+    if (
+      info.observationTime - state.drySince >=
+      config.rainLock.dryMinutes * MINUTE
+    ) {
+
+      // 60分間連続して雨がやんだ。
+      // 次の降雨イベントに備えて通知履歴を解除する。
+      state.rainLock = false;
+      state.drySince = null;
+      state.sentRules = {};
+    }
+  }
+
+  // 降雨しなかった予報の通知履歴をリセットする処理。
+  if (!wet && !state.rainLock) {
+
+    if (info.firstRainAt === null) {
+
+      if (state.noForecastSince === null) {
+        state.noForecastSince = nowMs;
+      }
+
+      if (
+        nowMs - state.noForecastSince >=
+        config.forecastClearResetMinutes * MINUTE
+      ) {
+        state.sentRules = {};
+      }
+
+    } else {
+      state.noForecastSince = null;
+    }
+
+  } else {
+    state.noForecastSince = null;
+  }
+
+  state.lastObservationAt = info.observationTime;
+
+  return state;
+}
+
+// ============================================================================
+// 夜間の通知抑制
+// ============================================================================
+
+function isQuiet(nowMs) {
+
+  // Mac miniのタイムゾーン設定に依存せずJSTで判定。
+  const hour = Number(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Tokyo',
+      hour: '2-digit',
+      hourCycle: 'h23'
+    }).format(new Date(nowMs))
+  );
+
+  const { start, end } = config.quietHours;
+
+  return start < end
+    ? hour >= start && hour < end
+    : hour >= start || hour < end;
+}
+
+// ============================================================================
+// 通知ルールの評価
+// ============================================================================
+
+// 設定ファイルのrules配列を順番に評価します。
+// 通知済みのルールは同じ降雨イベントでは実行しません。
+function eligibleRules(state, info, nowMs) {
+
+  // 降雨中、降雨後のロック中、夜間は通知しない。
+  if (
+    state.rainLock ||
+    info.observationRain >=
+      config.observationWetThreshold ||
+    isQuiet(nowMs) ||
+    info.minutesToRain === null
+  ) {
+    return [];
+  }
+
+  return config.rules.filter((rule) =>
+
+    // 有効化されたルールのみ。
+    rule.enabled &&
+
+    // この雨について未通知であること。
+    !state.sentRules[rule.id] &&
+
+    // 雨が降るまでの残り時間が条件内にあること。
+    info.minutesToRain > 0 &&
+    info.minutesToRain >= rule.minLeadMinutes &&
+    info.minutesToRain <= rule.maxLeadMinutes &&
+
+    // 5分前通知がすでに発生した後で、
+    // 遅れて「1時間前」通知を出すことを防ぐ。
+    !config.rules.some((shorter) =>
+      shorter.enabled &&
+      shorter.type === 'forecast' &&
+      shorter.maxLeadMinutes < rule.maxLeadMinutes &&
+      state.sentRules[shorter.id]
+    )
+  );
+}
+
+// ============================================================================
+// Google Homeへの音声通知
+// ============================================================================
+
+async function notifyHome(message) {
+
+  // 既存のslack2googlehomeをそのまま利用。
   const url = new URL('http://127.0.0.1:8080/say');
 
-  url.searchParams.set('text', 'まもなく雨が降りそうです');
+  url.searchParams.set('text', message);
 
   const response = await fetch(url, {
     signal: AbortSignal.timeout(5000)
@@ -292,113 +483,111 @@ async function notifyHome() {
   }
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // メイン処理
-// ---------------------------------------------------------------------------
+// ============================================================================
 
-// 1回の実行の流れ：
-//   (1) 起動オプションを確認
-//   (2) 日本時間で深夜帯かどうか判定
-//   (3) Yahoo!の実測・予測データを取得して解析
-//   (4) 前回の通知状態を読み込む
-//   (5) 雨が去った状態が続けば通知済みフラグを解除
-//   (6) 通知条件がそろえば/sayへリクエスト
-//   (7) 状態を保存して終了
 async function main() {
+
+  validateRules();
+
   const args = process.argv.slice(2);
+  const fixtureIdx = args.indexOf('--fixture');
+  const atIdx = args.indexOf('--at');
 
-  // --fixtureはテスト用JSONファイルを指定する引数です。
-  // --dry-runまたは--fixtureの場合は、音を鳴らさず状態も保存しません。
-  const fixtureAt = args.indexOf('--fixture');
-  const fixture = fixtureAt >= 0 ? args[fixtureAt + 1] : null;
-
-  if (fixtureAt >= 0 && !fixture) {
-    throw new Error('--fixture requires a file');
+  if (fixtureIdx >= 0 && !args[fixtureIdx + 1]) {
+    throw new Error('--fixture requires a path');
   }
 
-  const dryRun = args.includes('--dry-run') || Boolean(fixture);
-
-  const now = new Date();
-  const nowMs = now.getTime();
-
-  // Macのシステムタイムゾーンに依存せず、日本時間の「時」を求めます。
-  // 23時以上または7時未満ならquiet=trueです。
-  const hour = Number(new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Tokyo',
-    hour: '2-digit',
-    hourCycle: 'h23'
-  }).format(now));
-
-  const quiet = hour >= QUIET_START || hour < QUIET_END;
-
-  const data = await loadWeather(fixture);
-  const info = getRainInfo(data, nowMs);
-
-  // dry-runでは実際の通知履歴を変更しません。
-  const state = dryRun
-    ? { alerted: false, clearSince: null }
-    : readState();
-
-  // 30分間、雨なし状態が続いた場合は通知済みフラグを解除します。
-  if (info.allClear) {
-    if (!state.clearSince) {
-      state.clearSince = nowMs;
-    }
-
-    if (nowMs - state.clearSince >= CLEAR_RESET_MINUTES * 60000) {
-      state.alerted = false;
-    }
-  } else {
-    state.clearSince = null;
+  if (atIdx >= 0 && !args[atIdx + 1]) {
+    throw new Error('--at requires an ISO date');
   }
 
-  // 次の4条件を満たす場合のみ通知します。
-  //   1. 30分以内に一定以上の雨が予測される
-  //   2. 現在はほぼ降っていない
-  //   3. この降雨イベントではまだ通知していない
-  //   4. 深夜帯ではない
-  const soon =
-    info.minutes !== null &&
-    info.minutes <= LOOKAHEAD_MINUTES;
+  const fixture =
+    fixtureIdx >= 0 ? args[fixtureIdx + 1] : null;
 
-  const shouldAlert =
-    info.observedRain < CURRENT_DRY_THRESHOLD &&
-    soon &&
-    !state.alerted &&
-    !quiet;
+  if (atIdx >= 0 && !fixture) {
+    throw new Error('--at requires --fixture');
+  }
 
-  // 後から通知の判断理由を確認できるよう、ログに記録します。
+  const nowMs =
+    atIdx >= 0
+      ? Date.parse(args[atIdx + 1])
+      : Date.now();
+
+  if (!Number.isFinite(nowMs)) {
+    throw new Error('Invalid --at timestamp');
+  }
+
+  const dryRun =
+    args.includes('--dry-run') || Boolean(fixture);
+
+  // Yahoo! APIから現在の観測・予測データを取得。
+  const info = getWeatherInfo(
+    await loadWeather(fixture),
+    nowMs
+  );
+
+  // 状態更新を行ってから、通知条件を評価する。
+  const state = advanceState(
+    readState(),
+    info,
+    nowMs
+  );
+
+  const due = eligibleRules(state, info, nowMs);
+
+  // 通知の判断結果をログに残す。
   console.log(JSON.stringify({
-    time: now.toISOString(),
-    observedRain: info.observedRain,
-    minutesUntilRain: info.minutes,
-    quiet,
-    alreadyAlerted: state.alerted,
-    shouldAlert,
+    time: new Date(nowMs).toISOString(),
+    observationRain: info.observationRain,
+    minutesToRain: info.minutesToRain,
+    rainLock: state.rainLock,
+    drySince: state.drySince,
+    sentRules: state.sentRules,
+    notifications: due.map((rule) => rule.id),
+    quiet: isQuiet(nowMs),
     dryRun
   }));
 
-  // 通知に成功した後で状態を保存します。
-  // HTTP通信に失敗した場合は次回実行で再試行します。
-  if (shouldAlert) {
-    if (!dryRun) {
-      await notifyHome();
-    }
-
-    state.alerted = true;
-
-    console.log(dryRun ? 'DRY RUN: would notify' : 'NOTIFIED');
-  }
-
+  // 通知が失敗しても、降雨ロックの状態は保持する。
   if (!dryRun) {
     saveState(state);
   }
+
+  // 条件に一致した通知ルールを順番に実行。
+  for (const rule of due) {
+
+    if (!dryRun) {
+      await notifyHome(rule.message);
+    }
+
+    // 通知が成功したルールだけ通知済みにする。
+    state.sentRules[rule.id] = true;
+
+    if (!dryRun) {
+      saveState(state);
+    }
+
+    console.log(
+      `${dryRun ? 'DRY RUN' : 'NOTIFIED'}: ${rule.id}`
+    );
+  }
 }
 
-// 通信失敗やAPI形式の変更、設定ファイルの不備をログに記録します。
-// 異常終了した場合は終了コード1を返します。
-main().catch((error) => {
-  console.error('Rain check failed:', error.message);
-  process.exitCode = 1;
-});
+// 単体テストから判定関数を呼べるようにしておく。
+module.exports = {
+  parseJstTime,
+  getWeatherInfo,
+  normalizeState,
+  advanceState,
+  eligibleRules,
+  isQuiet
+};
 
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Rain check failed:', err.message);
+    process.exitCode = 1;
+  });
+}
