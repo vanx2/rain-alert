@@ -25,6 +25,7 @@ module.exports = {
 
   // JR住吉駅付近。経度,緯度の順。
   coordinates: '135.261859,34.719595',
+  coordinates: '135.2640184,34.7247423',
 
   // 降水強度の判定基準（mm/h）。
   forecastRainThreshold: 0.5,
@@ -56,7 +57,7 @@ module.exports = {
       minLeadMinutes: 50,
       maxLeadMinutes: 60,
       cooldownMinutes: 60,
-      message: '1時間以内に雨が降る予報です'
+      message: '1時間以内に雨'
     },
 
     // ② 直前予測通知
@@ -68,7 +69,7 @@ module.exports = {
       minLeadMinutes: 0,
       maxLeadMinutes: 5,
       cooldownMinutes: 60,
-      message: 'まもなく雨が降る予報です'
+      message: 'もうすぐ雨'
     },
 
     // ③ 降雨開始通知
@@ -78,8 +79,9 @@ module.exports = {
       enabled: true,
       type: 'observation_start',
       cooldownMinutes: 60,
-      message: '雨が降り始めました'
+      message: '雨です'
     }
 
   ]
 };
+
